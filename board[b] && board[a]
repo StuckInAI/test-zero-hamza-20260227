@@ -1,0 +1,414 @@
+board[c]) {
+      return board[a];
+    }
+  }
+  return null;
+}
+
+export function isBoardFull(board: (Player | null)[]): boolean {
+  return board.every(cell => cell !== null);
+}
+```
+
+## 3. Let's fix the database connection to initialize only once:
+
+```typescript:database/connection.ts
+import { DataSource } from 'typeorm';
+import { Game } from './entity/Game';
+import path from 'path';
+
+export const AppDataSource = new DataSource({
+  type: 'sqlite',
+  database: path.join(process.cwd(), 'database.sqlite'),
+  entities: [Game],
+  synchronize: process.env.NODE_ENV !== 'production', // Auto-create tables in dev
+  logging: false,
+});
+
+// Initialize connection
+let initialized = false;
+
+export async function initializeDatabase() {
+  if (!initialized) {
+    try {
+      await AppDataSource.initialize();
+      console.log('Database connection initialized');
+      initialized = true;
+    } catch (error) {
+      console.error('Error initializing database:', error);
+      throw error;
+    }
+  }
+}
+```
+
+## 4. Let's update the Game entity to be properly defined:
+
+```typescript:database/entity/Game.ts
+import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn } from 'typeorm';
+import { Player } from '@/types/game';
+
+@Entity()
+export class Game {
+  @PrimaryGeneratedColumn('uuid')
+  id!: string;
+
+  @Column({ default: 'Player X' })
+  playerX!: string;
+
+  @Column({ default: 'Player O' })
+  playerO!: string;
+
+  @Column('simple-json', { default: '[]' })
+  moves!: any[];
+
+  @Column({ type: 'varchar', nullable: true })
+  winner!: Player | null;
+
+  @CreateDateColumn()
+  createdAt!: Date;
+
+  @UpdateDateColumn()
+  updatedAt!: Date;
+}
+```
+
+## 5. Now let's update the API routes to use the proper initialization:
+
+```typescript:app/api/games/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { AppDataSource, initializeDatabase } from '@/database/connection';
+import { Game } from '@/database/entity/Game';
+
+export async function POST(request: NextRequest) {
+  try {
+    await initializeDatabase();
+
+    const { playerX, playerO } = await request.json();
+    const gameRepository = AppDataSource.getRepository(Game);
+    const game = gameRepository.create({
+      playerX: playerX || 'Player X',
+      playerO: playerO || 'Player O',
+      moves: [],
+      winner: null,
+    });
+    await gameRepository.save(game);
+
+    return NextResponse.json({ id: game.id, message: 'Game created' }, { status: 201 });
+  } catch (error) {
+    console.error('Error creating game:', error);
+    return NextResponse.json({ error: 'Failed to create game' }, { status: 500 });
+  }
+}
+
+export async function GET() {
+  try {
+    await initializeDatabase();
+
+    const gameRepository = AppDataSource.getRepository(Game);
+    const games = await gameRepository.find({ order: { createdAt: 'DESC' } });
+    return NextResponse.json(games);
+  } catch (error) {
+    console.error('Error fetching games:', error);
+    return NextResponse.json({ error: 'Failed to fetch games' }, { status: 500 });
+  }
+}
+```
+
+```typescript:app/api/games/[id]/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { AppDataSource, initializeDatabase } from '@/database/connection';
+import { Game } from '@/database/entity/Game';
+
+export async function GET(
+  request: NextRequest,
+  { params }: { params: { id: string } }
+) {
+  try {
+    await initializeDatabase();
+
+    const gameRepository = AppDataSource.getRepository(Game);
+    const game = await gameRepository.findOne({ where: { id: params.id } });
+    if (!game) {
+      return NextResponse.json({ error: 'Game not found' }, { status: 404 });
+    }
+
+    return NextResponse.json(game);
+  } catch (error) {
+    console.error('Error fetching game:', error);
+    return NextResponse.json({ error: 'Failed to fetch game' }, { status: 500 });
+  }
+}
+
+export async function PUT(
+  request: NextRequest,
+  { params }: { params: { id: string } }
+) {
+  try {
+    await initializeDatabase();
+
+    const { moves, winner } = await request.json();
+    const gameRepository = AppDataSource.getRepository(Game);
+    const game = await gameRepository.findOne({ where: { id: params.id } });
+    if (!game) {
+      return NextResponse.json({ error: 'Game not found' }, { status: 404 });
+    }
+
+    game.moves = moves || game.moves;
+    game.winner = winner !== undefined ? winner : game.winner;
+    await gameRepository.save(game);
+
+    return NextResponse.json({ message: 'Game updated', game });
+  } catch (error) {
+    console.error('Error updating game:', error);
+    return NextResponse.json({ error: 'Failed to update game' }, { status: 500 });
+  }
+}
+```
+
+## 6. Let's update the Dockerfile to properly set up the environment:
+
+```dockerfile:Dockerfile
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm ci --only=production
+
+# Copy source code
+COPY . .
+
+# Build the application
+RUN npm run build
+
+# Expose port
+EXPOSE 3000
+
+# Start the application
+CMD ["npm", "start"]
+```
+
+## 7. Let's update the docker-compose.yml:
+
+```yaml:docker-compose.yml
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+    volumes:
+      - ./database.sqlite:/app/database.sqlite
+    restart: unless-stopped
+```
+
+## 8. Let's create a simple test to verify the game logic works:
+
+```typescript:lib/gameLogic.test.ts
+import { checkWinner, isBoardFull } from './gameLogic';
+import { Player } from '@/types/game';
+
+describe('gameLogic', () => {
+  describe('checkWinner', () => {
+    it('should return null for empty board', () => {
+      const board = Array(9).fill(null);
+      expect(checkWinner(board)).toBeNull();
+    });
+
+    it('should detect horizontal win', () => {
+      const board = [
+        Player.X, Player.X, Player.X,
+        null, null, null,
+        null, null, null
+      ];
+      expect(checkWinner(board)).toBe(Player.X);
+    });
+
+    it('should detect vertical win', () => {
+      const board = [
+        Player.O, null, null,
+        Player.O, null, null,
+        Player.O, null, null
+      ];
+      expect(checkWinner(board)).toBe(Player.O);
+    });
+
+    it('should detect diagonal win', () => {
+      const board = [
+        Player.X, null, null,
+        null, Player.X, null,
+        null, null, Player.X
+      ];
+      expect(checkWinner(board)).toBe(Player.X);
+    });
+  });
+
+  describe('isBoardFull', () => {
+    it('should return false for empty board', () => {
+      const board = Array(9).fill(null);
+      expect(isBoardFull(board)).toBe(false);
+    });
+
+    it('should return true for full board', () => {
+      const board = Array(9).fill(Player.X);
+      expect(isBoardFull(board)).toBe(true);
+    });
+  });
+});
+```
+
+## 9. Let's update package.json to include test scripts and fix dependencies:
+
+```json:package.json
+{
+  "name": "test-zero",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "test": "jest",
+    "typeorm": "typeorm-ts-node-commonjs",
+    "migration:run": "npm run typeorm migration:run -- -d ./database/connection.ts",
+    "migration:generate": "npm run typeorm migration:generate -- -d ./database/connection.ts",
+    "migration:create": "npm run typeorm migration:create"
+  },
+  "dependencies": {
+    "@radix-ui/react-dialog": "^1.1.5",
+    "@radix-ui/react-icons": "^1.3.0",
+    "next": "14.2.4",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "tailwindcss": "3.4.1",
+    "typeorm": "0.3.20",
+    "sqlite3": "5.1.7",
+    "reflect-metadata": "^0.2.2"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "20.11.24",
+    "@types/react": "18.2.64",
+    "@types/react-dom": "18.2.21",
+    "@typescript-eslint/eslint-plugin": "^7.0.1",
+    "@typescript-eslint/parser": "^7.0.1",
+    "autoprefixer": "10.4.17",
+    "eslint": "^8.56.0",
+    "eslint-config-next": "14.2.4",
+    "jest": "^29.7.0",
+    "postcss": "8.4.35",
+    "ts-jest": "^29.1.2",
+    "ts-node": "^10.9.2",
+    "typescript": "5.3.3"
+  }
+}
+```
+
+## 10. Let's create a jest.config.js file for testing:
+
+```javascript:jest.config.js
+module.exports = {
+  preset: 'ts-jest',
+  testEnvironment: 'node',
+  moduleNameMapper: {
+    '^@/(.*)$': '<rootDir>/$1',
+  },
+  testMatch: ['**/*.test.ts'],
+  collectCoverageFrom: [
+    'lib/**/*.ts',
+    '!**/node_modules/**',
+  ],
+};
+```
+
+## 11. Let's update the next.config.js to properly handle TypeORM:
+
+```javascript:next.config.js
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  reactStrictMode: true,
+  swcMinify: true,
+  webpack: (config, { isServer }) => {
+    if (isServer) {
+      config.externals.push('typeorm');
+    }
+    return config;
+  }
+}
+
+module.exports = nextConfig
+```
+
+## 12. Let's create a simple README.md to document how to run the application:
+
+```markdown:README.md
+# Tic Tac Toe - Test Zero
+
+A fullstack Tic Tac Toe game built with Next.js 14, TypeScript, and SQLite.
+
+## Getting Started
+
+### Development
+
+1. Install dependencies:
+```bash
+npm install
+```
+
+2. Run the development server:
+```bash
+npm run dev
+```
+
+3. Open [http://localhost:3000](http://localhost:3000) in your browser.
+
+### Production with Docker
+
+1. Build and run with Docker Compose:
+```bash
+docker-compose up --build
+```
+
+2. Open [http://localhost:3000](http://localhost:3000) in your browser.
+
+### Running Tests
+
+```bash
+npm test
+```
+
+## Features
+
+- Fullstack Tic Tac Toe game
+- Game state persistence with SQLite
+- Responsive design with Tailwind CSS
+- Dark/light mode support
+- Docker support for easy deployment
+```
+
+## Summary of Changes:
+
+1. **Created missing files**: `types/game.ts`, `lib/gameLogic.ts`, `lib/gameLogic.test.ts`, `jest.config.js`, `README.md`
+2. **Fixed database connection**: Created proper initialization pattern to avoid multiple connections
+3. **Fixed Game entity**: Added proper TypeORM decorators
+4. **Updated API routes**: Use the new database initialization pattern
+5. **Added testing setup**: Jest configuration and a simple test for game logic
+6. **Updated Docker configuration**: Fixed Dockerfile and docker-compose.yml
+7. **Updated package.json**: Added test dependencies and scripts
+8. **Updated next.config.js**: Fixed TypeORM webpack configuration
+
+The application should now build and run successfully. The main issues were:
+- Missing type definitions
+- Missing game logic implementation
+- Database connection initialization issues
+- Missing test setup
+- Incomplete Docker configuration
+
+All these issues have been addressed with the changes above.
