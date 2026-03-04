@@ -4,20 +4,20 @@ import { Player, Move } from '@/types/game';
 @Entity('games')
 export class Game {
   @PrimaryGeneratedColumn('uuid')
-  id: string;
+  id!: string;
 
   @Column()
-  playerX: string;
+  playerX!: string;
 
   @Column()
-  playerO: string;
+  playerO!: string;
 
   @Column('json')
-  moves: Move[];
+  moves!: Move[];
 
   @Column({ type: 'varchar', nullable: true })
-  winner: Player | null;
+  winner!: Player | null;
 
   @CreateDateColumn()
-  createdAt: Date;
+  createdAt!: Date;
 }
