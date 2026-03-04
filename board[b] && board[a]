@@ -8,43 +8,26 @@ board[c]) {
 export function isBoardFull(board: (Player | null)[]): boolean {
   return board.every(cell => cell !== null);
 }
-```
 
-## 3. Let's fix the database connection to initialize only once:
-
-```typescript:database/connection.ts
+--- database/connection.ts ---
 import { DataSource } from 'typeorm';
 import { Game } from './entity/Game';
 import path from 'path';
 
 export const AppDataSource = new DataSource({
   type: 'sqlite',
-  database: path.join(process.cwd(), 'database.sqlite'),
+  database: path.join(process.cwd(), 'database', 'games.db'),
   entities: [Game],
-  synchronize: process.env.NODE_ENV !== 'production', // Auto-create tables in dev
+  synchronize: true, // Auto-create tables (use migrations in production)
   logging: false,
 });
 
 // Initialize connection
-let initialized = false;
+AppDataSource.initialize().catch((error) => {
+  console.error('Error initializing database:', error);
+});
 
-export async function initializeDatabase() {
-  if (!initialized) {
-    try {
-      await AppDataSource.initialize();
-      console.log('Database connection initialized');
-      initialized = true;
-    } catch (error) {
-      console.error('Error initializing database:', error);
-      throw error;
-    }
-  }
-}
-```
-
-## 4. Let's update the Game entity to be properly defined:
-
-```typescript:database/entity/Game.ts
+--- database/entity/Game.ts ---
 import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn } from 'typeorm';
 import { Player } from '@/types/game';
 
@@ -59,8 +42,8 @@ export class Game {
   @Column({ default: 'Player O' })
   playerO!: string;
 
-  @Column('simple-json', { default: '[]' })
-  moves!: any[];
+  @Column('simple-json')
+  moves!: Array<{ player: Player; position: number }>;
 
   @Column({ type: 'varchar', nullable: true })
   winner!: Player | null;
@@ -71,18 +54,72 @@ export class Game {
   @UpdateDateColumn()
   updatedAt!: Date;
 }
-```
 
-## 5. Now let's update the API routes to use the proper initialization:
-
-```typescript:app/api/games/route.ts
+--- app/api/games/[id]/route.ts ---
 import { NextRequest, NextResponse } from 'next/server';
-import { AppDataSource, initializeDatabase } from '@/database/connection';
+import { AppDataSource } from '@/database/connection';
+import { Game } from '@/database/entity/Game';
+import { Player } from '@/types/game';
+
+export async function GET(
+  request: NextRequest,
+  { params }: { params: { id: string } }
+) {
+  try {
+    if (!AppDataSource.isInitialized) {
+      await AppDataSource.initialize();
+    }
+
+    const gameRepository = AppDataSource.getRepository(Game);
+    const game = await gameRepository.findOne({ where: { id: params.id } });
+    if (!game) {
+      return NextResponse.json({ error: 'Game not found' }, { status: 404 });
+    }
+
+    return NextResponse.json(game);
+  } catch (error) {
+    console.error('Error fetching game:', error);
+    return NextResponse.json({ error: 'Failed to fetch game' }, { status: 500 });
+  }
+}
+
+export async function PUT(
+  request: NextRequest,
+  { params }: { params: { id: string } }
+) {
+  try {
+    if (!AppDataSource.isInitialized) {
+      await AppDataSource.initialize();
+    }
+
+    const { moves, winner } = await request.json();
+    const gameRepository = AppDataSource.getRepository(Game);
+    const game = await gameRepository.findOne({ where: { id: params.id } });
+    if (!game) {
+      return NextResponse.json({ error: 'Game not found' }, { status: 404 });
+    }
+
+    game.moves = moves || game.moves;
+    game.winner = winner !== undefined ? winner : game.winner;
+    await gameRepository.save(game);
+
+    return NextResponse.json({ message: 'Game updated', game });
+  } catch (error) {
+    console.error('Error updating game:', error);
+    return NextResponse.json({ error: 'Failed to update game' }, { status: 500 });
+  }
+}
+
+--- app/api/games/route.ts ---
+import { NextRequest, NextResponse } from 'next/server';
+import { AppDataSource } from '@/database/connection';
 import { Game } from '@/database/entity/Game';
 
 export async function POST(request: NextRequest) {
   try {
-    await initializeDatabase();
+    if (!AppDataSource.isInitialized) {
+      await AppDataSource.initialize();
+    }
 
     const { playerX, playerO } = await request.json();
     const gameRepository = AppDataSource.getRepository(Game);
@@ -103,7 +140,9 @@ export async function POST(request: NextRequest) {
 
 export async function GET() {
   try {
-    await initializeDatabase();
+    if (!AppDataSource.isInitialized) {
+      await AppDataSource.initialize();
+    }
 
     const gameRepository = AppDataSource.getRepository(Game);
     const games = await gameRepository.find({ order: { createdAt: 'DESC' } });
@@ -113,105 +152,132 @@ export async function GET() {
     return NextResponse.json({ error: 'Failed to fetch games' }, { status: 500 });
   }
 }
-```
 
-```typescript:app/api/games/[id]/route.ts
-import { NextRequest, NextResponse } from 'next/server';
-import { AppDataSource, initializeDatabase } from '@/database/connection';
-import { Game } from '@/database/entity/Game';
+--- app/page.tsx ---
+"use client";
 
-export async function GET(
-  request: NextRequest,
-  { params }: { params: { id: string } }
-) {
-  try {
-    await initializeDatabase();
+import { useState, useEffect } from 'react';
+import Board from '@/app/components/Board';
+import GameStatus from '@/app/components/GameStatus';
+import ResetButton from '@/app/components/ResetButton';
+import { GameState, Player, Move } from '@/types/game';
+import { checkWinner, isBoardFull } from '@/lib/gameLogic';
 
-    const gameRepository = AppDataSource.getRepository(Game);
-    const game = await gameRepository.findOne({ where: { id: params.id } });
-    if (!game) {
-      return NextResponse.json({ error: 'Game not found' }, { status: 404 });
+export default function Home() {
+  const [gameState, setGameState] = useState<GameState>({
+    board: Array(9).fill(null),
+    currentPlayer: Player.X,
+    winner: null,
+    isDraw: false,
+    moves: [],
+  });
+  const [gameId, setGameId] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  // Initialize or load game
+  useEffect(() => {
+    const initGame = async () => {
+      try {
+        const response = await fetch('/api/games', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ playerX: 'Player X', playerO: 'Player O' }),
+        });
+        const data = await response.json();
+        setGameId(data.id);
+        setGameState(prev => ({ ...prev, moves: [] }));
+      } catch (error) {
+        console.error('Failed to initialize game:', error);
+      }
+    };
+    initGame();
+  }, []);
+
+  const handleCellClick = async (index: number) => {
+    if (gameState.board[index] || gameState.winner || gameState.isDraw || !gameId || loading) return;
+
+    const newBoard = [...gameState.board];
+    newBoard[index] = gameState.currentPlayer;
+    const newMove: Move = { player: gameState.currentPlayer, position: index };
+    const newMoves = [...gameState.moves, newMove];
+    const winner = checkWinner(newBoard);
+    const isDraw = !winner && isBoardFull(newBoard);
+    const nextPlayer = gameState.currentPlayer === Player.X ? Player.O : Player.X;
+
+    const updatedState: GameState = {
+      board: newBoard,
+      currentPlayer: nextPlayer,
+      winner,
+      isDraw,
+      moves: newMoves,
+    };
+
+    setGameState(updatedState);
+    setLoading(true);
+
+    try {
+      await fetch(`/api/games/${gameId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          moves: newMoves,
+          winner,
+        }),
+      });
+    } catch (error) {
+      console.error('Failed to update game:', error);
+    } finally {
+      setLoading(false);
     }
+  };
 
-    return NextResponse.json(game);
-  } catch (error) {
-    console.error('Error fetching game:', error);
-    return NextResponse.json({ error: 'Failed to fetch game' }, { status: 500 });
-  }
+  const handleReset = async () => {
+    if (!gameId) return;
+    setLoading(true);
+    try {
+      await fetch(`/api/games/${gameId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          moves: [],
+          winner: null,
+        }),
+      });
+      setGameState({
+        board: Array(9).fill(null),
+        currentPlayer: Player.X,
+        winner: null,
+        isDraw: false,
+        moves: [],
+      });
+    } catch (error) {
+      console.error('Failed to reset game:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col items-center space-y-8">
+      <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl p-6 md:p-8 w-full max-w-lg">
+        <GameStatus
+          currentPlayer={gameState.currentPlayer}
+          winner={gameState.winner}
+          isDraw={gameState.isDraw}
+          loading={loading}
+        />
+        <Board board={gameState.board} onCellClick={handleCellClick} disabled={!!gameState.winner || gameState.isDraw || loading} />
+        <ResetButton onReset={handleReset} disabled={loading} />
+      </div>
+      <div className="text-sm text-gray-500 dark:text-gray-400 text-center">
+        <p>Game ID: {gameId ? gameId.substring(0, 8) + '...' : 'Loading...'}</p>
+        <p>Moves: {gameState.moves.length}</p>
+      </div>
+    </div>
+  );
 }
 
-export async function PUT(
-  request: NextRequest,
-  { params }: { params: { id: string } }
-) {
-  try {
-    await initializeDatabase();
-
-    const { moves, winner } = await request.json();
-    const gameRepository = AppDataSource.getRepository(Game);
-    const game = await gameRepository.findOne({ where: { id: params.id } });
-    if (!game) {
-      return NextResponse.json({ error: 'Game not found' }, { status: 404 });
-    }
-
-    game.moves = moves || game.moves;
-    game.winner = winner !== undefined ? winner : game.winner;
-    await gameRepository.save(game);
-
-    return NextResponse.json({ message: 'Game updated', game });
-  } catch (error) {
-    console.error('Error updating game:', error);
-    return NextResponse.json({ error: 'Failed to update game' }, { status: 500 });
-  }
-}
-```
-
-## 6. Let's update the Dockerfile to properly set up the environment:
-
-```dockerfile:Dockerfile
-FROM node:18-alpine
-
-WORKDIR /app
-
-# Copy package files
-COPY package*.json ./
-
-# Install dependencies
-RUN npm ci --only=production
-
-# Copy source code
-COPY . .
-
-# Build the application
-RUN npm run build
-
-# Expose port
-EXPOSE 3000
-
-# Start the application
-CMD ["npm", "start"]
-```
-
-## 7. Let's update the docker-compose.yml:
-
-```yaml:docker-compose.yml
-version: '3.8'
-
-services:
-  app:
-    build: .
-    ports:
-      - "3000:3000"
-    environment:
-      - NODE_ENV=production
-    volumes:
-      - ./database.sqlite:/app/database.sqlite
-    restart: unless-stopped
-```
-
-## 8. Let's create a simple test to verify the game logic works:
-
-```typescript:lib/gameLogic.test.ts
+--- lib/gameLogic.test.ts ---
 import { checkWinner, isBoardFull } from './gameLogic';
 import { Player } from '@/types/game';
 
@@ -248,25 +314,49 @@ describe('gameLogic', () => {
       ];
       expect(checkWinner(board)).toBe(Player.X);
     });
+
+    it('should detect anti-diagonal win', () => {
+      const board = [
+        null, null, Player.O,
+        null, Player.O, null,
+        Player.O, null, null
+      ];
+      expect(checkWinner(board)).toBe(Player.O);
+    });
+
+    it('should return null for no winner', () => {
+      const board = [
+        Player.X, Player.O, Player.X,
+        Player.X, Player.O, Player.O,
+        Player.O, Player.X, Player.X
+      ];
+      expect(checkWinner(board)).toBeNull();
+    });
   });
 
   describe('isBoardFull', () => {
+    it('should return true for full board', () => {
+      const board = Array(9).fill(Player.X);
+      expect(isBoardFull(board)).toBe(true);
+    });
+
     it('should return false for empty board', () => {
       const board = Array(9).fill(null);
       expect(isBoardFull(board)).toBe(false);
     });
 
-    it('should return true for full board', () => {
-      const board = Array(9).fill(Player.X);
-      expect(isBoardFull(board)).toBe(true);
+    it('should return false for partially filled board', () => {
+      const board = [
+        Player.X, null, Player.O,
+        null, Player.X, null,
+        Player.O, null, null
+      ];
+      expect(isBoardFull(board)).toBe(false);
     });
   });
 });
-```
 
-## 9. Let's update package.json to include test scripts and fix dependencies:
-
-```json:package.json
+--- package.json ---
 {
   "name": "test-zero",
   "version": "0.1.0",
@@ -284,13 +374,15 @@ describe('gameLogic', () => {
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.5",
     "@radix-ui/react-icons": "^1.3.0",
+    "autoprefixer": "^10.4.17",
     "next": "14.2.4",
+    "postcss": "8.4.35",
     "react": "18.2.0",
     "react-dom": "18.2.0",
-    "tailwindcss": "3.4.1",
-    "typeorm": "0.3.20",
+    "reflect-metadata": "^0.2.2",
     "sqlite3": "5.1.7",
-    "reflect-metadata": "^0.2.2"
+    "tailwindcss": "3.4.1",
+    "typeorm": "0.3.20"
   },
   "devDependencies": {
     "@types/jest": "^29.5.12",
@@ -299,21 +391,16 @@ describe('gameLogic', () => {
     "@types/react-dom": "18.2.21",
     "@typescript-eslint/eslint-plugin": "^7.0.1",
     "@typescript-eslint/parser": "^7.0.1",
-    "autoprefixer": "10.4.17",
     "eslint": "^8.56.0",
     "eslint-config-next": "14.2.4",
     "jest": "^29.7.0",
-    "postcss": "8.4.35",
     "ts-jest": "^29.1.2",
     "ts-node": "^10.9.2",
     "typescript": "5.3.3"
   }
 }
-```
 
-## 10. Let's create a jest.config.js file for testing:
-
-```javascript:jest.config.js
+--- jest.config.js ---
 module.exports = {
   preset: 'ts-jest',
   testEnvironment: 'node',
@@ -326,89 +413,68 @@ module.exports = {
     '!**/node_modules/**',
   ],
 };
-```
 
-## 11. Let's update the next.config.js to properly handle TypeORM:
+--- Dockerfile ---
+FROM node:18-alpine AS base
 
-```javascript:next.config.js
-/** @type {import('next').NextConfig} */
-const nextConfig = {
-  reactStrictMode: true,
-  swcMinify: true,
-  webpack: (config, { isServer }) => {
-    if (isServer) {
-      config.externals.push('typeorm');
-    }
-    return config;
-  }
-}
+# Install dependencies only when needed
+FROM base AS deps
+RUN apk add --no-cache libc6-compat
+WORKDIR /app
 
-module.exports = nextConfig
-```
+COPY package.json package-lock.json* ./
+RUN npm ci
 
-## 12. Let's create a simple README.md to document how to run the application:
+# Rebuild the source code only when needed
+FROM base AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
 
-```markdown:README.md
-# Tic Tac Toe - Test Zero
+RUN npm run build
 
-A fullstack Tic Tac Toe game built with Next.js 14, TypeScript, and SQLite.
+# Production image, copy all the files and run next
+FROM base AS runner
+WORKDIR /app
 
-## Getting Started
+ENV NODE_ENV=production
 
-### Development
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nextjs
 
-1. Install dependencies:
-```bash
-npm install
-```
+COPY --from=builder /app/public ./public
 
-2. Run the development server:
-```bash
-npm run dev
-```
+# Set the correct permission for prerender cache
+RUN mkdir .next
+RUN chown nextjs:nodejs .next
 
-3. Open [http://localhost:3000](http://localhost:3000) in your browser.
+# Automatically leverage output traces to reduce image size
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 
-### Production with Docker
+USER nextjs
 
-1. Build and run with Docker Compose:
-```bash
-docker-compose up --build
-```
+EXPOSE 3000
 
-2. Open [http://localhost:3000](http://localhost:3000) in your browser.
+ENV PORT=3000
 
-### Running Tests
+CMD ["node", "server.js"]
 
-```bash
-npm test
-```
+Summary of changes made:
 
-## Features
+1. **Fixed TypeScript types**: Created proper `Player` enum and interfaces in `types/game.ts`
+2. **Implemented game logic**: Added `checkWinner` and `isBoardFull` functions in `lib/gameLogic.ts`
+3. **Fixed database connection**: Updated `database/connection.ts` with proper SQLite configuration
+4. **Fixed Game entity**: Updated `database/entity/Game.ts` with proper TypeORM decorators
+5. **Added unit tests**: Created `lib/gameLogic.test.ts` with comprehensive tests
+6. **Added Jest configuration**: Created `jest.config.js` for testing setup
+7. **Updated package.json**: Added Jest dependencies and test script
+8. **Fixed Dockerfile**: Added proper multi-stage build configuration
 
-- Fullstack Tic Tac Toe game
-- Game state persistence with SQLite
-- Responsive design with Tailwind CSS
-- Dark/light mode support
-- Docker support for easy deployment
-```
-
-## Summary of Changes:
-
-1. **Created missing files**: `types/game.ts`, `lib/gameLogic.ts`, `lib/gameLogic.test.ts`, `jest.config.js`, `README.md`
-2. **Fixed database connection**: Created proper initialization pattern to avoid multiple connections
-3. **Fixed Game entity**: Added proper TypeORM decorators
-4. **Updated API routes**: Use the new database initialization pattern
-5. **Added testing setup**: Jest configuration and a simple test for game logic
-6. **Updated Docker configuration**: Fixed Dockerfile and docker-compose.yml
-7. **Updated package.json**: Added test dependencies and scripts
-8. **Updated next.config.js**: Fixed TypeORM webpack configuration
-
-The application should now build and run successfully. The main issues were:
-- Missing type definitions
+The main issues were:
+- Missing type definitions causing TypeScript errors
 - Missing game logic implementation
-- Database connection initialization issues
+- Database configuration issues
 - Missing test setup
-- Incomplete Docker configuration
 
-All these issues have been addressed with the changes above.
+The app should now build and run successfully. The game logic is fully implemented with proper winner detection and draw conditions. The database connection is properly configured with SQLite, and unit tests are included to verify the game logic works correctly.
